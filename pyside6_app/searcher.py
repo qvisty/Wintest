@@ -1,20 +1,41 @@
 """File search logic running in a background thread."""
 
 import os
+from datetime import datetime
 from pathlib import Path
 from PySide6.QtCore import QThread, Signal
 
 
 class FileSearcher(QThread):
-    result_found = Signal(str)
+    result_found = Signal(dict)
     search_done = Signal(int)
 
-    def __init__(self, directory: str, query: str, recursive: bool = True):
+    def __init__(self, directory: str, query: str, recursive: bool = True, extensions: list = None):
         super().__init__()
         self.directory = directory
         self.query = query.lower()
         self.recursive = recursive
+        self.extensions = [e.lower().lstrip(".") for e in extensions] if extensions else None
         self._stopped = False
+
+    def _match(self, name: str) -> bool:
+        if self.query and self.query not in name.lower():
+            return False
+        if self.extensions:
+            ext = Path(name).suffix.lower().lstrip(".")
+            if ext not in self.extensions:
+                return False
+        return True
+
+    def _file_info(self, full_path: str) -> dict:
+        stat = os.stat(full_path)
+        return {
+            "name": os.path.basename(full_path),
+            "path": full_path,
+            "ext": Path(full_path).suffix.lower(),
+            "size": stat.st_size,
+            "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+        }
 
     def run(self):
         count = 0
@@ -26,18 +47,24 @@ class FileSearcher(QThread):
                     for name in files:
                         if self._stopped:
                             break
-                        if self.query in name.lower():
+                        if self._match(name):
                             full_path = str(Path(root) / name)
-                            self.result_found.emit(full_path)
-                            count += 1
+                            try:
+                                self.result_found.emit(self._file_info(full_path))
+                                count += 1
+                            except OSError:
+                                pass
             else:
                 for name in os.listdir(self.directory):
                     if self._stopped:
                         break
                     full_path = str(Path(self.directory) / name)
-                    if os.path.isfile(full_path) and self.query in name.lower():
-                        self.result_found.emit(full_path)
-                        count += 1
+                    if os.path.isfile(full_path) and self._match(name):
+                        try:
+                            self.result_found.emit(self._file_info(full_path))
+                            count += 1
+                        except OSError:
+                            pass
         except PermissionError:
             pass
         self.search_done.emit(count)
