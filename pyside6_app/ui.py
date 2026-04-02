@@ -6,6 +6,7 @@ import sys
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QLabel, QListWidget, QFileDialog, QStatusBar,
+    QCheckBox,
 )
 from PySide6.QtCore import Qt
 from searcher import FileSearcher
@@ -39,6 +40,9 @@ class MainWindow(QMainWindow):
         self.search_input.setPlaceholderText("Skriv filnavn eller del af filnavn...")
         self.search_input.returnPressed.connect(self.start_search)
         search_row.addWidget(self.search_input)
+        self.recursive_cb = QCheckBox("Inkl. undermapper")
+        self.recursive_cb.setChecked(True)
+        search_row.addWidget(self.recursive_cb)
         self.search_btn = QPushButton("Søg")
         self.search_btn.clicked.connect(self.start_search)
         search_row.addWidget(self.search_btn)
@@ -74,7 +78,7 @@ class MainWindow(QMainWindow):
         self.search_btn.setEnabled(False)
         self.status.showMessage("Søger...")
 
-        self.searcher = FileSearcher(directory, query)
+        self.searcher = FileSearcher(directory, query, self.recursive_cb.isChecked())
         self.searcher.result_found.connect(self.add_result)
         self.searcher.search_done.connect(self.on_search_done)
         self.searcher.start()

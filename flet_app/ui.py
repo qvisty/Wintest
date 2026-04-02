@@ -23,6 +23,7 @@ def build_ui(page: ft.Page):
         hint_text="Skriv filnavn eller del af filnavn...",
         expand=True,
     )
+    recursive_cb = ft.Checkbox(label="Inkl. undermapper", value=True)
     search_btn = ft.ElevatedButton("Søg")
 
     def pick_directory(e):
@@ -75,7 +76,7 @@ def build_ui(page: ft.Page):
         status_text.value = "Søger..."
         page.update()
 
-        searcher = FileSearcher(directory, query, add_result, on_done)
+        searcher = FileSearcher(directory, query, add_result, on_done, recursive_cb.value)
         searcher_ref["current"] = searcher
         searcher.start()
 
@@ -86,7 +87,7 @@ def build_ui(page: ft.Page):
 
     page.add(
         ft.Row([dir_input, browse_btn]),
-        ft.Row([search_input, search_btn]),
+        ft.Row([search_input, recursive_cb, search_btn]),
         ft.Divider(),
         results,
         ft.Divider(),
