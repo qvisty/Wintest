@@ -8,28 +8,22 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QLabel, QFileDialog, QStatusBar,
     QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QTabWidget, QTextEdit,
 )
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from searcher import FileSearcher
+from validator import find_duplicates, format_size
 
-COMMON_EXTENSIONS = ["pdf", "docx", "xlsx", "msg", "doc", "xls", "ppt", "pptx", "txt", "csv", "jpg", "png"]
-
-
-def format_size(size_bytes: int) -> str:
-    if size_bytes < 1024:
-        return f"{size_bytes} B"
-    if size_bytes < 1024 * 1024:
-        return f"{size_bytes / 1024:.1f} KB"
-    if size_bytes < 1024 * 1024 * 1024:
-        return f"{size_bytes / (1024 * 1024):.1f} MB"
-    return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+WARN_COLOR = QColor(255, 240, 220)
+DUPLICATE_COLOR = QColor(255, 220, 220)
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("File Search (PySide6)")
-        self.resize(1000, 650)
+        self.setWindowTitle("ESDH File Scanner (PySide6)")
+        self.resize(1100, 700)
         self.searcher = None
         self._results_data = []
 
@@ -68,7 +62,6 @@ class MainWindow(QMainWindow):
         self.ext_input = QLineEdit()
         self.ext_input.setPlaceholderText("f.eks. pdf,docx,xlsx (tom = alle filtyper)")
         filter_row.addWidget(self.ext_input)
-        # Quick-select buttons
         for ext in ["pdf", "docx", "xlsx", "msg"]:
             btn = QPushButton(f".{ext}")
             btn.setCheckable(True)
@@ -77,23 +70,39 @@ class MainWindow(QMainWindow):
             filter_row.addWidget(btn)
         layout.addLayout(filter_row)
 
-        # Results table
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Filnavn", "Type", "Størrelse", "Ændret", "Sti"])
+        # Tabs: Results + Quality Report
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        # Tab 1: Results table
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(["Filnavn", "Type", "Størrelse", "Ændret", "Advarsler", "Sti"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSortingEnabled(True)
         self.table.doubleClicked.connect(self._on_table_double_click)
-        layout.addWidget(self.table)
+        self.tabs.addTab(self.table, "Resultater")
 
-        # Bottom row: export button + status
+        # Tab 2: Quality report
+        self.report = QTextEdit()
+        self.report.setReadOnly(True)
+        self.tabs.addTab(self.report, "Kvalitetsrapport")
+
+        # Bottom row
         bottom_row = QHBoxLayout()
         self.export_btn = QPushButton("Eksportér til CSV...")
         self.export_btn.clicked.connect(self.export_csv)
         self.export_btn.setEnabled(False)
         bottom_row.addWidget(self.export_btn)
+
+        self.dup_btn = QPushButton("Find dubletter")
+        self.dup_btn.clicked.connect(self.run_duplicate_check)
+        self.dup_btn.setEnabled(False)
+        bottom_row.addWidget(self.dup_btn)
+
         bottom_row.addStretch()
         layout.addLayout(bottom_row)
 
@@ -129,7 +138,6 @@ class MainWindow(QMainWindow):
         if not directory:
             return
 
-        # Stop any running search
         if self.searcher and self.searcher.isRunning():
             self.searcher.stop()
             self.searcher.wait()
@@ -137,8 +145,10 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
         self._results_data = []
+        self.report.clear()
         self.search_btn.setEnabled(False)
         self.export_btn.setEnabled(False)
+        self.dup_btn.setEnabled(False)
         self.status.showMessage("Søger...")
 
         query = self.search_input.text().strip()
@@ -161,19 +171,148 @@ class MainWindow(QMainWindow):
         self.table.setItem(row, 2, size_item)
 
         self.table.setItem(row, 3, QTableWidgetItem(info["modified"]))
-        self.table.setItem(row, 4, QTableWidgetItem(info["path"]))
+
+        warnings = info.get("warnings", [])
+        warn_text = "; ".join(warnings) if warnings else ""
+        self.table.setItem(row, 4, QTableWidgetItem(warn_text))
+
+        self.table.setItem(row, 5, QTableWidgetItem(info["path"]))
+
+        # Highlight rows with warnings
+        if warnings:
+            for col in range(6):
+                item = self.table.item(row, col)
+                if item:
+                    item.setBackground(WARN_COLOR)
 
     def on_search_done(self, count: int):
         self.search_btn.setEnabled(True)
         self.export_btn.setEnabled(count > 0)
+        self.dup_btn.setEnabled(count > 0)
         self.table.setSortingEnabled(True)
 
         total_size = sum(r["size"] for r in self._results_data)
-        self.status.showMessage(f"Fandt {count} fil(er) – samlet størrelse: {format_size(total_size)}")
+        warn_count = sum(1 for r in self._results_data if r.get("warnings"))
+        self.status.showMessage(
+            f"Fandt {count} fil(er) – {format_size(total_size)} – {warn_count} med advarsler"
+        )
+
+        self._generate_report()
+
+    def _generate_report(self):
+        """Generate the quality report tab content."""
+        lines = ["<h2>Kvalitetsrapport</h2>"]
+        data = self._results_data
+
+        # Summary
+        total = len(data)
+        total_size = sum(r["size"] for r in data)
+        lines.append(f"<p><b>Samlet:</b> {total} filer, {format_size(total_size)}</p>")
+
+        # File types breakdown
+        ext_counts = {}
+        for r in data:
+            ext = r["ext"] or "(ingen)"
+            ext_counts[ext] = ext_counts.get(ext, 0) + 1
+        lines.append("<h3>Filtyper</h3><ul>")
+        for ext, cnt in sorted(ext_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"<li><b>{ext}</b>: {cnt} filer</li>")
+        lines.append("</ul>")
+
+        # Warnings summary
+        warn_files = [r for r in data if r.get("warnings")]
+        if warn_files:
+            lines.append(f"<h3>Advarsler ({len(warn_files)} filer)</h3>")
+
+            # Group by warning type
+            warn_types = {}
+            for r in warn_files:
+                for w in r["warnings"]:
+                    warn_types.setdefault(w, []).append(r)
+
+            for wtype, files in sorted(warn_types.items(), key=lambda x: -len(x[1])):
+                lines.append(f"<h4>{wtype} ({len(files)})</h4><ul>")
+                for f in files[:20]:
+                    lines.append(f"<li>{f['name']} <span style='color:gray'>– {f['path']}</span></li>")
+                if len(files) > 20:
+                    lines.append(f"<li><i>...og {len(files) - 20} flere</i></li>")
+                lines.append("</ul>")
+        else:
+            lines.append("<h3>Ingen advarsler fundet</h3>")
+
+        self.report.setHtml("\n".join(lines))
+
+    def run_duplicate_check(self):
+        self.status.showMessage("Søger efter dubletter (beregner hash)...")
+        self.dup_btn.setEnabled(False)
+
+        # Run in background thread to avoid freezing UI
+        from PySide6.QtCore import QThread, Signal
+
+        class DupWorker(QThread):
+            done = Signal(dict)
+
+            def __init__(self, results):
+                super().__init__()
+                self.results = results
+
+            def run(self):
+                duplicates = find_duplicates(self.results)
+                self.done.emit(duplicates)
+
+        def on_dup_done(duplicates):
+            self.dup_btn.setEnabled(True)
+
+            # Mark duplicate rows in table
+            dup_paths = set()
+            for group in duplicates.values():
+                for f in group:
+                    dup_paths.add(f["path"])
+
+            for row in range(self.table.rowCount()):
+                path_item = self.table.item(row, 5)
+                if path_item and path_item.text() in dup_paths:
+                    for col in range(6):
+                        item = self.table.item(row, col)
+                        if item:
+                            item.setBackground(DUPLICATE_COLOR)
+
+            # Add to report
+            html = self.report.toHtml()
+            lines = ["<h3>Dubletter</h3>"]
+            if duplicates:
+                total_dup = sum(len(g) for g in duplicates.values())
+                wasted = sum(
+                    sum(f["size"] for f in group[1:])
+                    for group in duplicates.values()
+                )
+                lines.append(
+                    f"<p><b>{total_dup} filer</b> i <b>{len(duplicates)} grupper</b> "
+                    f"– spildplads: <b>{format_size(wasted)}</b></p>"
+                )
+                for i, (h, group) in enumerate(duplicates.items(), 1):
+                    lines.append(f"<h4>Gruppe {i} ({len(group)} filer, {format_size(group[0]['size'])} hver)</h4><ul>")
+                    for f in group:
+                        lines.append(f"<li>{f['path']}</li>")
+                    lines.append("</ul>")
+            else:
+                lines.append("<p>Ingen dubletter fundet.</p>")
+
+            self.report.setHtml(html + "\n".join(lines))
+            self.tabs.setCurrentIndex(1)
+
+            dup_count = sum(len(g) for g in duplicates.values()) if duplicates else 0
+            self.status.showMessage(
+                f"Dublet-tjek færdig – {dup_count} dubletter i {len(duplicates)} grupper"
+            )
+
+        self._dup_worker = DupWorker(self._results_data)
+        self._dup_worker.done.connect(on_dup_done)
+        self._dup_worker.start()
 
     def _on_table_double_click(self, index):
         row = index.row()
-        path_item = self.table.item(row, 4)
+        path_item = self.table.item(row, 5)
         if not path_item:
             return
         path = path_item.text()
@@ -193,8 +332,9 @@ class MainWindow(QMainWindow):
 
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f, delimiter=";")
-            writer.writerow(["Filnavn", "Type", "Størrelse (bytes)", "Ændret", "Fuld sti"])
+            writer.writerow(["Filnavn", "Type", "Størrelse (bytes)", "Ændret", "Advarsler", "Fuld sti"])
             for info in self._results_data:
-                writer.writerow([info["name"], info["ext"], info["size"], info["modified"], info["path"]])
+                warnings = "; ".join(info.get("warnings", []))
+                writer.writerow([info["name"], info["ext"], info["size"], info["modified"], warnings, info["path"]])
 
         self.status.showMessage(f"Eksporteret {len(self._results_data)} rækker til {path}")

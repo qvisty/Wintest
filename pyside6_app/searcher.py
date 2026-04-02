@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 from PySide6.QtCore import QThread, Signal
+from validator import validate_file
 
 
 class FileSearcher(QThread):
@@ -29,13 +30,15 @@ class FileSearcher(QThread):
 
     def _file_info(self, full_path: str) -> dict:
         stat = os.stat(full_path)
-        return {
+        info = {
             "name": os.path.basename(full_path),
             "path": full_path,
             "ext": Path(full_path).suffix.lower(),
             "size": stat.st_size,
             "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
         }
+        info["warnings"] = validate_file(info)
+        return info
 
     def run(self):
         count = 0
