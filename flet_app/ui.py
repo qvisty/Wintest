@@ -8,13 +8,16 @@ from threading import Thread
 import flet as ft
 from searcher import FileSearcher
 from validator import find_duplicates, format_size
+from metadata import extract_metadata
+from tagger import TagStore
 
 
 def build_ui(page: ft.Page):
     searcher_ref = {"current": None}
     results_data = []
+    tag_store = TagStore()
 
-    # Results table
+    # --- Results table ---
     results_table = ft.DataTable(
         columns=[
             ft.DataColumn(ft.Text("Filnavn")),
@@ -22,6 +25,7 @@ def build_ui(page: ft.Page):
             ft.DataColumn(ft.Text("Størrelse"), numeric=True),
             ft.DataColumn(ft.Text("Ændret")),
             ft.DataColumn(ft.Text("Advarsler")),
+            ft.DataColumn(ft.Text("Tags")),
             ft.DataColumn(ft.Text("Sti")),
         ],
         expand=True,
@@ -31,26 +35,46 @@ def build_ui(page: ft.Page):
     results_scroll = ft.ListView(expand=True)
     results_scroll.controls.append(results_table)
 
-    # Quality report tab
+    # --- Quality report ---
     report_text = ft.Markdown("", expand=True, selectable=True)
     report_scroll = ft.ListView(expand=True)
     report_scroll.controls.append(report_text)
 
-    # Tabs
+    # --- Case mappings report ---
+    case_report_text = ft.Markdown("", expand=True, selectable=True)
+    case_report_scroll = ft.ListView(expand=True)
+    case_report_scroll.controls.append(case_report_text)
+
+    # --- Tabs ---
     tabs = ft.Tabs(
         selected_index=0,
         tabs=[
             ft.Tab(text="Resultater", content=results_scroll),
             ft.Tab(text="Kvalitetsrapport", content=report_scroll),
+            ft.Tab(text="Sagsnr.-oversigt", content=case_report_scroll),
         ],
         expand=True,
     )
+
+    # --- Detail panel (right side) ---
+    preview_image = ft.Image(visible=False, width=260, height=160, fit=ft.ImageFit.CONTAIN)
+    preview_text = ft.Text("Vælg en fil for at se detaljer", size=12)
+    meta_text = ft.Markdown("", selectable=True)
+    tag_display = ft.Text("Ingen tags", size=12)
+    tag_combo = ft.TextField(label="Tag", hint_text="Skriv tag...", expand=True, dense=True)
+
+    selected_path_ref = {"current": ""}
 
     status_text = ft.Text("Klar.", size=12)
 
     dir_input = ft.TextField(
         value=os.path.expanduser("~"),
         label="Mappe",
+        expand=True,
+    )
+    case_input = ft.TextField(
+        label="Sagsnr.",
+        hint_text="Tildel sagsnr. til den valgte mappe...",
         expand=True,
     )
     search_input = ft.TextField(
@@ -67,6 +91,40 @@ def build_ui(page: ft.Page):
     search_btn = ft.ElevatedButton("Søg")
     export_btn = ft.ElevatedButton("Eksportér til CSV...", disabled=True)
     dup_btn = ft.ElevatedButton("Find dubletter", disabled=True)
+
+    # --- Case number ---
+
+    def load_case_number():
+        directory = (dir_input.value or "").strip()
+        case = tag_store.get_case_number(directory) if directory else ""
+        case_input.value = case
+
+    def save_case_number(e):
+        directory = (dir_input.value or "").strip()
+        case = (case_input.value or "").strip()
+        if directory:
+            tag_store.set_case_number(directory, case)
+            status_text.value = f"Sagsnr. '{case}' gemt for {directory}"
+            update_case_report()
+            page.update()
+
+    def update_case_report():
+        mappings = tag_store.get_all_case_mappings()
+        if not mappings:
+            case_report_text.value = "Ingen sagsnr.-mappinger gemt endnu."
+            return
+        lines = ["## Sagsnr.-oversigt\n", "| Mappe | Sagsnr. |", "|---|---|"]
+        for folder, case in sorted(mappings.items()):
+            lines.append(f"| {folder} | **{case}** |")
+        case_report_text.value = "\n".join(lines)
+
+    def on_dir_change(e):
+        load_case_number()
+        page.update()
+
+    dir_input.on_change = on_dir_change
+
+    # --- Extension toggles ---
 
     def make_ext_toggler(ext):
         def handler(e):
@@ -90,10 +148,13 @@ def build_ui(page: ft.Page):
             return None
         return [e.strip().lower().lstrip(".") for e in text.split(",") if e.strip()]
 
+    # --- Directory picker ---
+
     def pick_directory(e):
         def on_result(e: ft.FilePickerResultEvent):
             if e.path:
                 dir_input.value = e.path
+                load_case_number()
                 page.update()
 
         picker = ft.FilePicker(on_result=on_result)
@@ -111,11 +172,99 @@ def build_ui(page: ft.Page):
                 subprocess.Popen(["xdg-open", os.path.dirname(path)])
         return handler
 
+    # --- Selection / Preview / Metadata ---
+
+    def on_row_selected(path):
+        def handler(e):
+            selected_path_ref["current"] = path
+            refresh_detail_panel(path)
+        return handler
+
+    def refresh_detail_panel(path):
+        if not path:
+            return
+
+        # Preview
+        ext = os.path.splitext(path)[1].lower()
+        image_exts = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".ico", ".webp"}
+        if ext in image_exts:
+            preview_image.src = path
+            preview_image.visible = True
+            preview_text.visible = False
+        else:
+            preview_image.visible = False
+            preview_text.value = os.path.basename(path)
+            preview_text.visible = True
+
+        # Tags
+        refresh_tag_display(path)
+
+        # Metadata in background
+        meta_text.value = "*Henter metadata...*"
+        page.update()
+
+        def load_meta():
+            meta = extract_metadata(path)
+            lines = []
+            for key, value in meta.items():
+                lines.append(f"**{key}:** {value}")
+            meta_text.value = "\n\n".join(lines) if lines else "*Ingen metadata*"
+            page.update()
+
+        Thread(target=load_meta, daemon=True).start()
+
+    def refresh_tag_display(path):
+        tags = tag_store.get_tags(path)
+        tag_display.value = ", ".join(tags) if tags else "Ingen tags"
+
+    # --- Tagging ---
+
+    def add_tag(e):
+        path = selected_path_ref["current"]
+        tag = (tag_combo.value or "").strip()
+        if path and tag:
+            tag_store.add_tag(path, tag)
+            refresh_tag_display(path)
+            update_tag_in_table(path)
+            tag_combo.value = ""
+            page.update()
+
+    def remove_tag(e):
+        path = selected_path_ref["current"]
+        tag = (tag_combo.value or "").strip()
+        if path and tag:
+            tag_store.remove_tag(path, tag)
+            refresh_tag_display(path)
+            update_tag_in_table(path)
+            tag_combo.value = ""
+            page.update()
+
+    def make_quick_tagger(tag):
+        def handler(e):
+            path = selected_path_ref["current"]
+            if path:
+                tag_store.add_tag(path, tag)
+                refresh_tag_display(path)
+                update_tag_in_table(path)
+                page.update()
+        return handler
+
+    def update_tag_in_table(path):
+        tags = tag_store.get_tags(path)
+        for row in results_table.rows:
+            path_cell = row.cells[6].content
+            if hasattr(path_cell, "value") and path_cell.value == path:
+                row.cells[5].content.value = ", ".join(tags)
+                break
+
+    # --- Search ---
+
     def add_result(info: dict):
         results_data.append(info)
         warnings = info.get("warnings", [])
         warn_text = "; ".join(warnings) if warnings else ""
         row_color = ft.Colors.AMBER_50 if warnings else None
+        tags = tag_store.get_tags(info["path"])
 
         results_table.rows.append(
             ft.DataRow(
@@ -125,10 +274,11 @@ def build_ui(page: ft.Page):
                     ft.DataCell(ft.Text(format_size(info["size"]))),
                     ft.DataCell(ft.Text(info["modified"])),
                     ft.DataCell(ft.Text(warn_text, color=ft.Colors.ORANGE_800 if warnings else None, size=11)),
+                    ft.DataCell(ft.Text(", ".join(tags))),
                     ft.DataCell(ft.Text(info["path"], size=11)),
                 ],
                 color=row_color,
-                on_select_changed=lambda e, p=info["path"]: open_file_location(p)(e),
+                on_select_changed=on_row_selected(info["path"]),
             )
         )
         page.update()
@@ -139,7 +289,7 @@ def build_ui(page: ft.Page):
         total_size = sum(r["size"] for r in data)
 
         lines = [
-            f"## Kvalitetsrapport\n",
+            "## Kvalitetsrapport\n",
             f"**Samlet:** {total} filer, {format_size(total_size)}\n",
             "### Filtyper\n",
         ]
@@ -181,6 +331,7 @@ def build_ui(page: ft.Page):
         )
 
         generate_report()
+        update_case_report()
         page.update()
 
     def start_search(e):
@@ -207,6 +358,8 @@ def build_ui(page: ft.Page):
         searcher_ref["current"] = searcher
         searcher.start()
 
+    # --- Duplicate check ---
+
     def run_duplicate_check(e):
         dup_btn.disabled = True
         status_text.value = "Søger efter dubletter (beregner hash)..."
@@ -215,25 +368,20 @@ def build_ui(page: ft.Page):
         def do_check():
             duplicates = find_duplicates(results_data)
 
-            # Mark duplicate rows
             dup_paths = set()
             for group in duplicates.values():
                 for f in group:
                     dup_paths.add(f["path"])
 
             for row in results_table.rows:
-                path_cell = row.cells[5].content
+                path_cell = row.cells[6].content
                 if hasattr(path_cell, "value") and path_cell.value in dup_paths:
                     row.color = ft.Colors.RED_50
 
-            # Add to report
             lines = [report_text.value, "\n### Dubletter\n"]
             if duplicates:
                 total_dup = sum(len(g) for g in duplicates.values())
-                wasted = sum(
-                    sum(f["size"] for f in group[1:])
-                    for group in duplicates.values()
-                )
+                wasted = sum(sum(f["size"] for f in group[1:]) for group in duplicates.values())
                 lines.append(
                     f"**{total_dup} filer** i **{len(duplicates)} grupper** "
                     f"– spildplads: **{format_size(wasted)}**\n"
@@ -255,6 +403,8 @@ def build_ui(page: ft.Page):
 
         Thread(target=do_check, daemon=True).start()
 
+    # --- CSV Export ---
+
     def export_csv_action(e):
         def on_save_result(e: ft.FilePickerResultEvent):
             if not e.path:
@@ -262,12 +412,20 @@ def build_ui(page: ft.Page):
             path = e.path
             if not path.endswith(".csv"):
                 path += ".csv"
+
+            case_num = (case_input.value or "").strip()
+
             with open(path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f, delimiter=";")
-                writer.writerow(["Filnavn", "Type", "Størrelse (bytes)", "Ændret", "Advarsler", "Fuld sti"])
+                writer.writerow(["Filnavn", "Type", "Størrelse (bytes)", "Ændret", "Advarsler", "Tags", "Sagsnr.", "Fuld sti"])
                 for info in results_data:
                     warnings = "; ".join(info.get("warnings", []))
-                    writer.writerow([info["name"], info["ext"], info["size"], info["modified"], warnings, info["path"]])
+                    tags = ", ".join(tag_store.get_tags(info["path"]))
+                    folder_case = tag_store.get_case_number(os.path.dirname(info["path"])) or case_num
+                    writer.writerow([
+                        info["name"], info["ext"], info["size"], info["modified"],
+                        warnings, tags, folder_case, info["path"],
+                    ])
             status_text.value = f"Eksporteret {len(results_data)} rækker til {path}"
             page.update()
 
@@ -280,19 +438,64 @@ def build_ui(page: ft.Page):
             allowed_extensions=["csv"],
         )
 
+    # --- Wire up ---
     search_btn.on_click = start_search
     search_input.on_submit = start_search
     export_btn.on_click = export_csv_action
     dup_btn.on_click = run_duplicate_check
 
     browse_btn = ft.ElevatedButton("Gennemse...", on_click=pick_directory)
+    save_case_btn = ft.ElevatedButton("Gem sagsnr.", on_click=save_case_number)
+
+    # Detail panel (right side)
+    detail_panel = ft.Container(
+        width=300,
+        content=ft.Column([
+            ft.Text("Forhåndsvisning", weight=ft.FontWeight.BOLD, size=14),
+            preview_image,
+            preview_text,
+            ft.Divider(),
+            ft.Text("Metadata", weight=ft.FontWeight.BOLD, size=14),
+            meta_text,
+            ft.Divider(),
+            ft.Text("Tags", weight=ft.FontWeight.BOLD, size=14),
+            tag_display,
+            ft.Row([
+                tag_combo,
+                ft.IconButton(ft.Icons.ADD, on_click=add_tag, tooltip="Tilføj tag"),
+                ft.IconButton(ft.Icons.REMOVE, on_click=remove_tag, tooltip="Fjern tag"),
+            ]),
+            ft.Row([
+                ft.OutlinedButton("ESDH-klar", on_click=make_quick_tagger("ESDH-klar"),
+                                  style=ft.ButtonStyle(padding=5)),
+                ft.OutlinedButton("Konvertér", on_click=make_quick_tagger("Skal konverteres"),
+                                  style=ft.ButtonStyle(padding=5)),
+                ft.OutlinedButton("Arkivér", on_click=make_quick_tagger("Arkivér"),
+                                  style=ft.ButtonStyle(padding=5)),
+                ft.OutlinedButton("Slet", on_click=make_quick_tagger("Slet"),
+                                  style=ft.ButtonStyle(padding=5)),
+            ], wrap=True),
+        ], scroll=ft.ScrollMode.AUTO),
+        padding=ft.padding.only(left=10),
+    )
+
+    # Main layout
+    main_content = ft.Row([
+        ft.Column([tabs], expand=True),
+        detail_panel,
+    ], expand=True)
 
     page.add(
         ft.Row([dir_input, browse_btn]),
+        ft.Row([case_input, save_case_btn]),
         ft.Row([search_input, recursive_cb, search_btn]),
         ft.Row([ext_input] + ext_buttons),
         ft.Divider(),
-        tabs,
+        main_content,
         ft.Divider(),
         ft.Row([export_btn, dup_btn, ft.Container(expand=True), status_text]),
     )
+
+    # Initial load
+    load_case_number()
+    update_case_report()

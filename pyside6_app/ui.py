@@ -8,24 +8,53 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QLabel, QFileDialog, QStatusBar,
     QCheckBox, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QTabWidget, QTextEdit,
+    QTabWidget, QTextEdit, QSplitter, QGroupBox, QFormLayout, QInputDialog,
+    QScrollArea, QComboBox,
 )
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor
+from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QColor, QPixmap
 from searcher import FileSearcher
 from validator import find_duplicates, format_size
+from metadata import extract_metadata
+from tagger import TagStore
 
 WARN_COLOR = QColor(255, 240, 220)
 DUPLICATE_COLOR = QColor(255, 220, 220)
+
+
+class MetadataWorker(QThread):
+    done = Signal(dict)
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+
+    def run(self):
+        meta = extract_metadata(self.path)
+        self.done.emit(meta)
+
+
+class DupWorker(QThread):
+    done = Signal(dict)
+
+    def __init__(self, results):
+        super().__init__()
+        self.results = results
+
+    def run(self):
+        self.done.emit(find_duplicates(self.results))
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ESDH File Scanner (PySide6)")
-        self.resize(1100, 700)
+        self.resize(1200, 750)
         self.searcher = None
         self._results_data = []
+        self._meta_worker = None
+        self._dup_worker = None
+        self.tag_store = TagStore()
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -40,6 +69,17 @@ class MainWindow(QMainWindow):
         browse_btn.clicked.connect(self.pick_directory)
         dir_row.addWidget(browse_btn)
         layout.addLayout(dir_row)
+
+        # Case number row
+        case_row = QHBoxLayout()
+        case_row.addWidget(QLabel("Sagsnr:"))
+        self.case_input = QLineEdit()
+        self.case_input.setPlaceholderText("Tildel sagsnr. til den valgte mappe...")
+        case_row.addWidget(self.case_input)
+        save_case_btn = QPushButton("Gem sagsnr.")
+        save_case_btn.clicked.connect(self._save_case_number)
+        case_row.addWidget(save_case_btn)
+        layout.addLayout(case_row)
 
         # Search bar
         search_row = QHBoxLayout()
@@ -70,26 +110,107 @@ class MainWindow(QMainWindow):
             filter_row.addWidget(btn)
         layout.addLayout(filter_row)
 
-        # Tabs: Results + Quality Report
+        # Main content: splitter with table on left, detail panel on right
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(splitter)
+
+        # Left side: tabs
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
         self.tabs = QTabWidget()
-        layout.addWidget(self.tabs)
+        left_layout.addWidget(self.tabs)
 
         # Tab 1: Results table
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["Filnavn", "Type", "Størrelse", "Ændret", "Advarsler", "Sti"])
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ["Filnavn", "Type", "Størrelse", "Ændret", "Advarsler", "Tags", "Sti"]
+        )
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSortingEnabled(True)
         self.table.doubleClicked.connect(self._on_table_double_click)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
         self.tabs.addTab(self.table, "Resultater")
 
         # Tab 2: Quality report
         self.report = QTextEdit()
         self.report.setReadOnly(True)
         self.tabs.addTab(self.report, "Kvalitetsrapport")
+
+        # Tab 3: Case mappings
+        self.case_report = QTextEdit()
+        self.case_report.setReadOnly(True)
+        self.tabs.addTab(self.case_report, "Sagsnr.-oversigt")
+
+        splitter.addWidget(left_widget)
+
+        # Right side: detail/preview panel
+        right_widget = QWidget()
+        right_widget.setMinimumWidth(280)
+        right_widget.setMaximumWidth(400)
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(4, 0, 0, 0)
+
+        # Preview area
+        preview_group = QGroupBox("Forhåndsvisning")
+        preview_layout = QVBoxLayout(preview_group)
+        self.preview_label = QLabel("Vælg en fil for at se detaljer")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setMinimumHeight(150)
+        self.preview_label.setStyleSheet("background: #f5f5f5; border: 1px solid #ddd; padding: 4px;")
+        preview_layout.addWidget(self.preview_label)
+        right_layout.addWidget(preview_group)
+
+        # Metadata area
+        meta_group = QGroupBox("Metadata")
+        meta_layout = QVBoxLayout(meta_group)
+        self.meta_text = QTextEdit()
+        self.meta_text.setReadOnly(True)
+        self.meta_text.setMaximumHeight(200)
+        meta_layout.addWidget(self.meta_text)
+        right_layout.addWidget(meta_group)
+
+        # Tagging area
+        tag_group = QGroupBox("Tags")
+        tag_layout = QVBoxLayout(tag_group)
+        self.tag_display = QLabel("Ingen tags")
+        tag_layout.addWidget(self.tag_display)
+
+        tag_input_row = QHBoxLayout()
+        self.tag_combo = QComboBox()
+        self.tag_combo.setEditable(True)
+        self.tag_combo.setPlaceholderText("Skriv eller vælg tag...")
+        tag_input_row.addWidget(self.tag_combo)
+        add_tag_btn = QPushButton("+")
+        add_tag_btn.setMaximumWidth(30)
+        add_tag_btn.clicked.connect(self._add_tag)
+        tag_input_row.addWidget(add_tag_btn)
+        remove_tag_btn = QPushButton("-")
+        remove_tag_btn.setMaximumWidth(30)
+        remove_tag_btn.clicked.connect(self._remove_tag)
+        tag_input_row.addWidget(remove_tag_btn)
+        tag_layout.addLayout(tag_input_row)
+
+        # Predefined tag buttons
+        predefined_row = QHBoxLayout()
+        for tag in ["ESDH-klar", "Skal konverteres", "Arkivér", "Slet"]:
+            btn = QPushButton(tag)
+            btn.setStyleSheet("font-size: 10px; padding: 2px 6px;")
+            btn.clicked.connect(self._make_quick_tagger(tag))
+            predefined_row.addWidget(btn)
+        tag_layout.addLayout(predefined_row)
+
+        right_layout.addWidget(tag_group)
+        right_layout.addStretch()
+
+        splitter.addWidget(right_widget)
+        splitter.setSizes([800, 300])
 
         # Bottom row
         bottom_row = QHBoxLayout()
@@ -111,6 +232,129 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status)
         self.status.showMessage("Klar.")
 
+        # Load case number for initial directory
+        self._load_case_number()
+        self.dir_input.textChanged.connect(self._load_case_number)
+
+    # --- Case number ---
+
+    def _load_case_number(self):
+        directory = self.dir_input.text().strip()
+        case = self.tag_store.get_case_number(directory) if directory else ""
+        self.case_input.setText(case)
+
+    def _save_case_number(self):
+        directory = self.dir_input.text().strip()
+        case = self.case_input.text().strip()
+        if directory:
+            self.tag_store.set_case_number(directory, case)
+            self.status.showMessage(f"Sagsnr. '{case}' gemt for {directory}")
+            self._update_case_report()
+
+    def _update_case_report(self):
+        mappings = self.tag_store.get_all_case_mappings()
+        if not mappings:
+            self.case_report.setHtml("<p>Ingen sagsnr.-mappinger gemt endnu.</p>")
+            return
+        lines = ["<h2>Sagsnr.-oversigt</h2><table border='1' cellpadding='4' cellspacing='0'>"]
+        lines.append("<tr><th>Mappe</th><th>Sagsnr.</th></tr>")
+        for folder, case in sorted(mappings.items()):
+            lines.append(f"<tr><td>{folder}</td><td><b>{case}</b></td></tr>")
+        lines.append("</table>")
+        self.case_report.setHtml("\n".join(lines))
+
+    # --- Tagging ---
+
+    def _selected_file_path(self) -> str:
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return ""
+        row = rows[0].row()
+        item = self.table.item(row, 6)
+        return item.text() if item else ""
+
+    def _refresh_tag_display(self):
+        path = self._selected_file_path()
+        if not path:
+            self.tag_display.setText("Ingen fil valgt")
+            return
+        tags = self.tag_store.get_tags(path)
+        self.tag_display.setText(", ".join(tags) if tags else "Ingen tags")
+        # Update tag column in table
+        self._update_tag_column(path, tags)
+        # Refresh combo box with all known tags
+        self.tag_combo.clear()
+        self.tag_combo.addItems(self.tag_store.all_tags())
+
+    def _update_tag_column(self, path: str, tags: list):
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 6)
+            if item and item.text() == path:
+                self.table.item(row, 5).setText(", ".join(tags))
+                break
+
+    def _add_tag(self):
+        path = self._selected_file_path()
+        tag = self.tag_combo.currentText().strip()
+        if path and tag:
+            self.tag_store.add_tag(path, tag)
+            self._refresh_tag_display()
+
+    def _remove_tag(self):
+        path = self._selected_file_path()
+        tag = self.tag_combo.currentText().strip()
+        if path and tag:
+            self.tag_store.remove_tag(path, tag)
+            self._refresh_tag_display()
+
+    def _make_quick_tagger(self, tag: str):
+        def handler():
+            path = self._selected_file_path()
+            if path:
+                self.tag_store.add_tag(path, tag)
+                self._refresh_tag_display()
+        return handler
+
+    # --- Selection / Preview / Metadata ---
+
+    def _on_selection_changed(self):
+        path = self._selected_file_path()
+        if not path:
+            return
+
+        self._refresh_tag_display()
+
+        # Show image preview for supported types
+        ext = os.path.splitext(path)[1].lower()
+        image_exts = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".ico", ".webp"}
+        if ext in image_exts:
+            pixmap = QPixmap(path)
+            if not pixmap.isNull():
+                scaled = pixmap.scaled(
+                    self.preview_label.width() - 10, 150,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                self.preview_label.setPixmap(scaled)
+            else:
+                self.preview_label.setText("Kunne ikke vise billede")
+        else:
+            self.preview_label.setText(os.path.basename(path))
+
+        # Load metadata in background
+        self.meta_text.setPlainText("Henter metadata...")
+        self._meta_worker = MetadataWorker(path)
+        self._meta_worker.done.connect(self._show_metadata)
+        self._meta_worker.start()
+
+    def _show_metadata(self, meta: dict):
+        lines = []
+        for key, value in meta.items():
+            lines.append(f"<b>{key}:</b> {value}")
+        self.meta_text.setHtml("<br>".join(lines) if lines else "Ingen metadata fundet")
+
+    # --- Ext toggler ---
+
     def _make_ext_toggler(self, ext: str):
         def toggler(checked):
             current = [e.strip() for e in self.ext_input.text().split(",") if e.strip()]
@@ -128,10 +372,14 @@ class MainWindow(QMainWindow):
             return None
         return [e.strip().lower().lstrip(".") for e in text.split(",") if e.strip()]
 
+    # --- Directory picker ---
+
     def pick_directory(self):
         path = QFileDialog.getExistingDirectory(self, "Vælg mappe", self.dir_input.text())
         if path:
             self.dir_input.setText(path)
+
+    # --- Search ---
 
     def start_search(self):
         directory = self.dir_input.text().strip()
@@ -176,11 +424,14 @@ class MainWindow(QMainWindow):
         warn_text = "; ".join(warnings) if warnings else ""
         self.table.setItem(row, 4, QTableWidgetItem(warn_text))
 
-        self.table.setItem(row, 5, QTableWidgetItem(info["path"]))
+        # Tags
+        tags = self.tag_store.get_tags(info["path"])
+        self.table.setItem(row, 5, QTableWidgetItem(", ".join(tags)))
 
-        # Highlight rows with warnings
+        self.table.setItem(row, 6, QTableWidgetItem(info["path"]))
+
         if warnings:
-            for col in range(6):
+            for col in range(7):
                 item = self.table.item(row, col)
                 if item:
                     item.setBackground(WARN_COLOR)
@@ -198,18 +449,16 @@ class MainWindow(QMainWindow):
         )
 
         self._generate_report()
+        self._update_case_report()
 
     def _generate_report(self):
-        """Generate the quality report tab content."""
         lines = ["<h2>Kvalitetsrapport</h2>"]
         data = self._results_data
 
-        # Summary
         total = len(data)
         total_size = sum(r["size"] for r in data)
         lines.append(f"<p><b>Samlet:</b> {total} filer, {format_size(total_size)}</p>")
 
-        # File types breakdown
         ext_counts = {}
         for r in data:
             ext = r["ext"] or "(ingen)"
@@ -219,17 +468,13 @@ class MainWindow(QMainWindow):
             lines.append(f"<li><b>{ext}</b>: {cnt} filer</li>")
         lines.append("</ul>")
 
-        # Warnings summary
         warn_files = [r for r in data if r.get("warnings")]
         if warn_files:
             lines.append(f"<h3>Advarsler ({len(warn_files)} filer)</h3>")
-
-            # Group by warning type
             warn_types = {}
             for r in warn_files:
                 for w in r["warnings"]:
                     warn_types.setdefault(w, []).append(r)
-
             for wtype, files in sorted(warn_types.items(), key=lambda x: -len(x[1])):
                 lines.append(f"<h4>{wtype} ({len(files)})</h4><ul>")
                 for f in files[:20]:
@@ -242,42 +487,28 @@ class MainWindow(QMainWindow):
 
         self.report.setHtml("\n".join(lines))
 
+    # --- Duplicates ---
+
     def run_duplicate_check(self):
         self.status.showMessage("Søger efter dubletter (beregner hash)...")
         self.dup_btn.setEnabled(False)
 
-        # Run in background thread to avoid freezing UI
-        from PySide6.QtCore import QThread, Signal
-
-        class DupWorker(QThread):
-            done = Signal(dict)
-
-            def __init__(self, results):
-                super().__init__()
-                self.results = results
-
-            def run(self):
-                duplicates = find_duplicates(self.results)
-                self.done.emit(duplicates)
-
         def on_dup_done(duplicates):
             self.dup_btn.setEnabled(True)
 
-            # Mark duplicate rows in table
             dup_paths = set()
             for group in duplicates.values():
                 for f in group:
                     dup_paths.add(f["path"])
 
             for row in range(self.table.rowCount()):
-                path_item = self.table.item(row, 5)
+                path_item = self.table.item(row, 6)
                 if path_item and path_item.text() in dup_paths:
-                    for col in range(6):
+                    for col in range(7):
                         item = self.table.item(row, col)
                         if item:
                             item.setBackground(DUPLICATE_COLOR)
 
-            # Add to report
             html = self.report.toHtml()
             lines = ["<h3>Dubletter</h3>"]
             if duplicates:
@@ -310,9 +541,11 @@ class MainWindow(QMainWindow):
         self._dup_worker.done.connect(on_dup_done)
         self._dup_worker.start()
 
+    # --- Open file ---
+
     def _on_table_double_click(self, index):
         row = index.row()
-        path_item = self.table.item(row, 5)
+        path_item = self.table.item(row, 6)
         if not path_item:
             return
         path = path_item.text()
@@ -323,6 +556,8 @@ class MainWindow(QMainWindow):
         else:
             subprocess.Popen(["xdg-open", os.path.dirname(path)])
 
+    # --- CSV Export ---
+
     def export_csv(self):
         path, _ = QFileDialog.getSaveFileName(
             self, "Gem CSV-fil", "filsøgning.csv", "CSV-filer (*.csv)"
@@ -330,11 +565,18 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
+        case_num = self.case_input.text().strip()
+
         with open(path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f, delimiter=";")
-            writer.writerow(["Filnavn", "Type", "Størrelse (bytes)", "Ændret", "Advarsler", "Fuld sti"])
+            writer.writerow(["Filnavn", "Type", "Størrelse (bytes)", "Ændret", "Advarsler", "Tags", "Sagsnr.", "Fuld sti"])
             for info in self._results_data:
                 warnings = "; ".join(info.get("warnings", []))
-                writer.writerow([info["name"], info["ext"], info["size"], info["modified"], warnings, info["path"]])
+                tags = ", ".join(self.tag_store.get_tags(info["path"]))
+                folder_case = self.tag_store.get_case_number(os.path.dirname(info["path"])) or case_num
+                writer.writerow([
+                    info["name"], info["ext"], info["size"], info["modified"],
+                    warnings, tags, folder_case, info["path"],
+                ])
 
         self.status.showMessage(f"Eksporteret {len(self._results_data)} rækker til {path}")
